@@ -208,21 +208,19 @@ class FacturacionController extends Controller
                         $productos = Producto::select("nombre", "id", "costoactual AS precioventa1", "impuesto_id")
                             ->with('impuesto')
                             ->where('nombre', 'LIKE', "%{$query}%")
-                            ->where('tipoproducto', 1)
-                            //->where('facturable', 1)
+                            ->whereIn('tipoproducto', [1, 2])
                             ->get();
 
                             return response()->json($productos);
 
-                    break;        
+                    break;
 
                     case 4:
 
                         $productos = Producto::select("nombre", "id", "costoactual AS precioventa1", "impuesto_id")
                             ->with('impuesto')
                             ->where('nombre', 'LIKE', "%{$query}%")
-                            ->where('tipoproducto', 1)
-                            //->where('facturable', 1)
+                            ->whereIn('tipoproducto', [1, 2])
                             ->get();
 
                             return response()->json($productos);
@@ -309,11 +307,19 @@ class FacturacionController extends Controller
                 
                 $query = $request->get('search');
 
-                $productos = Producto::select("nombre", "id", "precioventa1", "impuesto_id")
+                $productos = Producto::select("nombre", "id", "precioventa1", "impuesto_id", "tipoproducto")
                             ->with('impuesto')
                             ->where('nombre', 'LIKE', "%{$query}%")
-                            ->where('tipoproducto', 1)
-                            ->get();
+                            ->whereIn('tipoproducto', [1, 2])
+                            ->get()
+                            ->map(function($p) {
+                                $tieneReceta = DB::table('recetas_has_productos')
+                                    ->where('receta_id', $p->id)->exists();
+                                $p->etiqueta = $p->tipoproducto == 1
+                                    ? 'Insumo'
+                                    : ($tieneReceta ? 'Sub-receta' : 'Servicio');
+                                return $p;
+                            });
                 
                             return response()->json($productos);
 
@@ -350,8 +356,59 @@ class FacturacionController extends Controller
 
             ]);
 
+            // Validar stock en ventas (transaccion_id=1)
+            $idTipoTransaccion = Concepto::where("id", $request->get('concepto'))->value("transaccion_id");
+            $productoValidar = Producto::find($request->get('productoID'));
+
+            if($idTipoTransaccion == 1){
+
+                if($productoValidar && $productoValidar->tipoproducto == 1){
+                    // Insumo directo: validar su propio stock descontando lo ya en carrito
+                    $cantidadEnCarrito = Temporary::where('consecutivo_id', $request->get('consecutivo'))
+                        ->where('producto_id', $request->get('productoID'))
+                        ->sum('cantidad');
+                    $disponible = $productoValidar->existenciactual - $cantidadEnCarrito;
+                    if($disponible < $request->get('cantidad')){
+                        return response()->json([
+                            "error"       => true,
+                            "transaccion" => "",
+                            "productos"   => [],
+                            "message"     => "Stock insuficiente de '{$productoValidar->nombre}'. Disponible: {$disponible}, Solicitado: {$request->get('cantidad')}."
+                        ]);
+                    }
+
+                } elseif($productoValidar && DB::table('recetas_has_productos')->where('receta_id', $productoValidar->id)->exists()){
+                    // Producto con receta (cualquier tipo): expandir recursivamente y validar insumos hoja
+                    $visitados  = [];
+                    $insumos    = $this->expandirIngredientes(
+                        $request->get('productoID'),
+                        (float) $request->get('cantidad'),
+                        $visitados
+                    );
+
+                    $errores = [];
+                    foreach($insumos as $insumo){
+                        $cantidadEnCarrito = Temporary::where('consecutivo_id', $request->get('consecutivo'))
+                            ->where('producto_id', $insumo['producto_id'])
+                            ->sum('cantidad');
+                        $disponible = $insumo['existenciactual'] - $cantidadEnCarrito;
+                        if($disponible < $insumo['cantidad']){
+                            $errores[] = "{$insumo['nombre']} (Disponible: {$disponible}, Requerido: {$insumo['cantidad']})";
+                        }
+                    }
+                    if(!empty($errores)){
+                        return response()->json([
+                            "error"       => true,
+                            "transaccion" => "",
+                            "productos"   => [],
+                            "message"     => "Stock insuficiente para '{$productoValidar->nombre}': " . implode(', ', $errores) . "."
+                        ]);
+                    }
+                }
+            }
+
             $temporary = Temporary::create([
-                
+
                 'consecutivo_id' => $request->get('consecutivo'),
                 'producto_id' => $request->get('productoID'),
                 'impuesto_id' => $request->get('impuestoID'),
@@ -363,7 +420,7 @@ class FacturacionController extends Controller
                 'preciounitario' => $request->get('precio'),
                 'baseunitario' => ($request->get('precio') / (($request->get('impuesto')/100)+1)),
                 'mesa_id' => $request->get('mesa')
-            
+
             ]);
 
             $temporal = DB::table("temporaries")
@@ -386,19 +443,18 @@ class FacturacionController extends Controller
 
         
         } catch (\Throwable $th) {
-        
+
             return response()->json([
-                    
-                "error" =>  $th,
 
+                "error"      => true,
                 "transaccion" => "",
+                "productos"  => [],
+                "message"    => "Error al agregar producto: " . $th->getMessage()
 
-                "message" => "Error!"
-            
             ]);
-        
-        }    
-        
+
+        }
+
     }
 
     public function destroy($id, $consecutivo)
@@ -452,19 +508,24 @@ class FacturacionController extends Controller
 
             ]);
 
+            DB::beginTransaction();
+
             //Grabo el encabezado de la factura
+            $transaccionPrincipal = null;
             $transactions = Transaction::create([
                 
                 'concepto_id' => $request->get('concepto_id'),
                 'documento_id' => $request->get('documento_id'),
                 'user_id' => Auth::id(),
                 'fecha' => $date->format("Y-m-d"),
-                'hora' => $date->format("H-i-s"),
+                'hora' => $date->format("H:i:s"),
                 'estado' => "N",
                 'consecutivo' => Transaccion::where("id", $request->get('transaccion_id'))->max("consecutivo"),
                 'observacion' => $request->get('observacion')               
             
             ]);
+
+            $transaccionPrincipal = $transactions->id;
 
             //Retorno los items del documento actual desde la tabla temporal
             $temporaries = Temporary::all()->where("consecutivo_id", "=", $consecutivoTemporal);
@@ -477,6 +538,43 @@ class FacturacionController extends Controller
 
                 case 1://ventas
 
+                    // Validar stock suficiente antes de escribir cualquier dato
+                    foreach($temporaries as $temporary){
+
+                        if(DB::table('recetas_has_productos')->where('receta_id', $temporary->producto_id)->exists()){
+
+                            // Expandir recursivamente y validar todos los insumos hoja
+                            $visitados = [];
+                            $insumos   = $this->expandirIngredientes(
+                                $temporary->producto_id,
+                                (float) $temporary->cantidad,
+                                $visitados
+                            );
+
+                            foreach($insumos as $insumo){
+                                if($insumo['existenciactual'] < $insumo['cantidad']){
+                                    throw new \Exception(
+                                        "Stock insuficiente del ingrediente '{$insumo['nombre']}'. ".
+                                        "Disponible: {$insumo['existenciactual']}, Requerido: {$insumo['cantidad']}."
+                                    );
+                                }
+                            }
+
+                        } else {
+
+                            // Insumo sin receta: validar su propio stock (tipoproducto=1)
+                            $productoStock = Producto::find($temporary->producto_id);
+                            if($productoStock->tipoproducto == 1 && $productoStock->existenciactual < $temporary->cantidad){
+                                throw new \Exception(
+                                    "Stock insuficiente del producto '{$productoStock->nombre}'. ".
+                                    "Disponible: {$productoStock->existenciactual}, Requerido: {$temporary->cantidad}."
+                                );
+                            }
+
+                        }
+
+                    }
+
                     //I update the inventory for each item
                     foreach($temporaries as $temporary){
 
@@ -485,67 +583,48 @@ class FacturacionController extends Controller
 
                             $withreceta = $withreceta + 1;
 
-                            //grabo el detalle de la transacción
+                            // Costo de la receta calculado recursivamente (incluye sub-recetas)
+                            $visitadosCosto = [];
+                            $costoReceta    = $this->calcularCostoReceta(
+                                $temporary->producto_id, 1.0, $visitadosCosto
+                            );
+
                             DetailTransaction::create([
-                            
+
                                 'transaction_id' => $transactions->id,
-                                'producto_id' => $temporary->producto_id,
-                                'impuesto_id' => $temporary->impuesto_id,
-                                'cantidad' => $temporary->cantidad,
-                                'descuento' => $temporary->descuento,
-                                'impuesto' => $temporary->impuesto,
+                                'producto_id'    => $temporary->producto_id,
+                                'impuesto_id'    => $temporary->impuesto_id,
+                                'cantidad'       => $temporary->cantidad,
+                                'descuento'      => $temporary->descuento,
+                                'impuesto'       => $temporary->impuesto,
                                 'preciounitario' => $temporary->preciounitario,
-                                'baseunitario' => $temporary->baseunitario,
-                                'costoventa' => DB::table('productos')
-                                                        ->join('recetas_has_productos', 'productos.id', '=', 'recetas_has_productos.producto_id')
-                                                        ->join('recetas', 'recetas_has_productos.receta_id', '=', 'recetas.id')
-                                                        ->where('recetas.id', $temporary->producto_id)
-                                                        ->selectRaw('SUM(recetas_has_productos.cantidad * productos.costoactual) AS coste_total')
-                                                        ->value('coste_total'),
-                                'costopromedio' => DB::table('productos')
-                                                        ->join('recetas_has_productos', 'productos.id', '=', 'recetas_has_productos.producto_id')
-                                                        ->join('recetas', 'recetas_has_productos.receta_id', '=', 'recetas.id')
-                                                        ->where('recetas.id', $temporary->producto_id)
-                                                        ->selectRaw('SUM(recetas_has_productos.cantidad * productos.costoactual) AS coste_total')
-                                                        ->value('coste_total'),
-                            
+                                'baseunitario'   => $temporary->baseunitario,
+                                'costoventa'     => $costoReceta,
+                                'costopromedio'  => $costoReceta,
+
                             ]);
-                            //fin
 
-                            //I get the amount current
-                            $amountCurrent = Producto::where("id", $temporary->producto_id)->value("existenciactual");
-                            //I update the inventory
+                            // Actualizar inventario y costo del producto elaborado
                             $producto = Producto::find($temporary->producto_id);
-                            $producto->existenciactual = ($amountCurrent - $temporary->cantidad);
+                            $producto->existenciactual = $producto->existenciactual - $temporary->cantidad;
+                            $producto->costoactual     = $costoReceta;
                             $producto->save();
 
-                            //We search the components what belong to the recipe
-                            $dataReceta = Receta::find($temporary->producto_id);
+                            // Descontar ingredientes expandiendo recursivamente sub-recetas
+                            $visitados = [];
+                            $insumos   = $this->expandirIngredientes(
+                                $temporary->producto_id,
+                                (float) $temporary->cantidad,
+                                $visitados
+                            );
 
-                            $dataReceta->productos;
-
-                            foreach($dataReceta->productos as $receta){
-
-                                //I get the amount current
-                                $amountCurrent = Producto::where("id", $receta->id)->value("existenciactual");
-                                //I update the inventory
-                                $producto = Producto::find($receta->id);
-                                $producto->existenciactual = ($amountCurrent - ($receta->pivot->cantidad * $temporary->cantidad));
-                                
-                                $producto->save();
-
+                            foreach($insumos as $insumo){
+                                $ingrediente = Producto::find($insumo['producto_id']);
+                                if($ingrediente){
+                                    $ingrediente->existenciactual = $ingrediente->existenciactual - $insumo['cantidad'];
+                                    $ingrediente->save();
+                                }
                             }
-                            //fin
-
-                            //I update current coste for finished product
-                            $producto = Producto::find($temporary->producto_id);
-                            $producto->costoactual = DB::table('productos')
-                                                            ->join('recetas_has_productos', 'productos.id', '=', 'recetas_has_productos.producto_id')
-                                                            ->join('recetas', 'recetas_has_productos.receta_id', '=', 'recetas.id')
-                                                            ->where('recetas.id', $temporary->producto_id)
-                                                            ->selectRaw('SUM(recetas_has_productos.cantidad * productos.costoactual) AS coste_total')
-                                                            ->value('coste_total');
-                            $producto->save();
 
                         }
                         //fin
@@ -622,7 +701,7 @@ class FacturacionController extends Controller
                             'documento_id' => $request->get('documento_id'),
                             'user_id' => Auth::id(),
                             'fecha' => $date->format("Y-m-d"),
-                            'hora' => $date->format("H-i-s"),
+                            'hora' => $date->format("H:i:s"),
                             'estado' => "N",
                             'consecutivo' => Transaccion::where("id", $request->get('transaccion_id'))->max("consecutivo"),
                             'observacion' => $request->get('observacion')               
@@ -668,42 +747,45 @@ class FacturacionController extends Controller
                             'documento_id' => $request->get('documento_id'),
                             'user_id' => Auth::id(),
                             'fecha' => $date->format("Y-m-d"),
-                            'hora' => $date->format("H-i-s"),
+                            'hora' => $date->format("H:i:s"),
                             'estado' => "N",
                             'consecutivo' => Transaccion::where("id", $request->get('transaccion_id'))->max("consecutivo"),
                             'observacion' => $request->get('observacion')               
                         
                         ]); 
                         
-                        //Grabo el detalle de la salida de la materia prima por cada producto con receta
+                        // Concepto 99: solo insumos directos del nivel principal.
+                        // Las sub-recetas generan sus propios ciclos 99→98→97 internamente.
                         foreach($temporaries as $temporary){
 
-                            //Validate if the product has recipe
                             if(DB::table('recetas_has_productos')->where('receta_id', $temporary->producto_id)->exists()){
 
-                                //We search the components what belong to the recipe
-                                $dataReceta = Receta::find($temporary->producto_id);
+                                $insumosDirectos = $this->generarTransaccionesSubReceta(
+                                    $temporary->producto_id,
+                                    (float) $temporary->cantidad,
+                                    $request->get('documento_id'),
+                                    Auth::id(),
+                                    $date->format("Y-m-d"),
+                                    $date->format("H:i:s"),
+                                    Transaccion::where("id", $request->get('transaccion_id'))->max("consecutivo"),
+                                    $request->get('observacion') ?? ''
+                                );
 
-                                $dataReceta->productos;
-
-                                //grabo el detalle de la transacción
-                                foreach($dataReceta->productos as $receta){
-
-                                        DetailTransaction::create([
-                                        
-                                            'transaction_id' => $transactions->id,
-                                            'producto_id' => $receta->pivot->producto_id,
-                                            'impuesto_id' => 4,
-                                            'cantidad' => $receta->pivot->cantidad * $temporary->cantidad,
-                                            'descuento' => 0,
-                                            'impuesto' => 0,
-                                            'preciounitario' => Producto::where('id', $receta->pivot->producto_id)->value('costoactual'),
-                                            'baseunitario' => Producto::where('id', $receta->pivot->producto_id)->value('costoactual'),
-                                            'costoventa' => Producto::where('id', $receta->pivot->producto_id)->value('costoactual'),
-                                            'costopromedio' => Producto::where('id', $receta->pivot->producto_id)->value('costoactual'),
-                                        
-                                        ]);
-                                        //fin
+                                // Registrar solo los insumos directos en el concepto 99 principal
+                                foreach($insumosDirectos as $insumo){
+                                    $costoInsumo = Producto::where('id', $insumo['producto_id'])->value('costoactual');
+                                    DetailTransaction::create([
+                                        'transaction_id' => $transactions->id,
+                                        'producto_id'    => $insumo['producto_id'],
+                                        'impuesto_id'    => 4,
+                                        'cantidad'       => $insumo['cantidad'],
+                                        'descuento'      => 0,
+                                        'impuesto'       => 0,
+                                        'preciounitario' => $costoInsumo,
+                                        'baseunitario'   => $costoInsumo,
+                                        'costoventa'     => $costoInsumo,
+                                        'costopromedio'  => $costoInsumo,
+                                    ]);
                                 }
 
                             }
@@ -722,43 +804,46 @@ class FacturacionController extends Controller
                     }
                     //fin
 
-                    $mesa = Mesa::find($request->get('mesa'));  
-         
-                    $mesa->responsable = $request->get('');
-                    
+                    $mesa = Mesa::find($request->get('mesa'));
+
+                    $mesa->responsable = null;
+
                     $mesa->save();
 
                 break;
 
                 case 2://Compras
-                    
+
                     //I update the inventory for each item
                     foreach($temporaries as $temporary){
 
-                        //grabo el detalle de la transacción
+                        $producto       = Producto::find($temporary->producto_id);
+                        $stockActual    = $producto->existenciactual;
+                        $costoActual    = $producto->costoactual;
+                        $valorCompra    = ($temporary->preciounitario * $temporary->cantidad) * (1 - $temporary->descuento / 100);
+                        $costoUnitario  = $valorCompra / $temporary->cantidad;
+                        $nuevoDenominador = $stockActual + $temporary->cantidad;
+                        $costoPromedio  = $nuevoDenominador > 0
+                            ? round((($stockActual * $costoActual) + $valorCompra) / $nuevoDenominador, 2)
+                            : round($costoUnitario, 2);
+
                         DetailTransaction::create([
-                        
+
                             'transaction_id' => $transactions->id,
-                            'producto_id' => $temporary->producto_id,
-                            'impuesto_id' => $temporary->impuesto_id,
-                            'cantidad' => $temporary->cantidad,
-                            'descuento' => $temporary->descuento,
-                            'impuesto' => $temporary->impuesto,
+                            'producto_id'    => $temporary->producto_id,
+                            'impuesto_id'    => $temporary->impuesto_id,
+                            'cantidad'       => $temporary->cantidad,
+                            'descuento'      => $temporary->descuento,
+                            'impuesto'       => $temporary->impuesto,
                             'preciounitario' => $temporary->preciounitario,
-                            'baseunitario' => $temporary->baseunitario,
-                            'costoventa' => ((($temporary->preciounitario*$temporary->cantidad)-(($temporary->preciounitario*$temporary->cantidad)*($temporary->descuento/100))) / $temporary->cantidad),
-                            'costopromedio' => ( 
-                                round(( ( (Producto::where('id', $temporary->producto_id)->value('existenciactual') * Producto::where('id', $temporary->producto_id)->value('costoactual')) + (($temporary->preciounitario*$temporary->cantidad)-(($temporary->preciounitario*$temporary->cantidad)*($temporary->descuento/100)))  ) / (Producto::where('id', $temporary->producto_id)->value('existenciactual') + $temporary->cantidad) ),2)
-                            ),                    
-                        
+                            'baseunitario'   => $temporary->baseunitario,
+                            'costoventa'     => $costoUnitario,
+                            'costopromedio'  => $costoPromedio,
+
                         ]);
 
-                        //I get the amount current
-                        $amountCurrent = Producto::where("id", $temporary->producto_id)->value("existenciactual");
-                        //I update the inventory
-                        $producto = Producto::find($temporary->producto_id);
-                        $producto->existenciactual = ($amountCurrent + $temporary->cantidad);
-                        $producto->costoactual = round(( ( (Producto::where('id', $temporary->producto_id)->value('existenciactual') * Producto::where('id', $temporary->producto_id)->value('costoactual')) + (($temporary->preciounitario*$temporary->cantidad)-(($temporary->preciounitario*$temporary->cantidad)*($temporary->descuento/100)))  ) / (Producto::where('id', $temporary->producto_id)->value('existenciactual') + $temporary->cantidad) ),2);
+                        $producto->existenciactual = $stockActual + $temporary->cantidad;
+                        $producto->costoactual     = $costoPromedio;
                         $producto->save();
 
                     }
@@ -869,67 +954,47 @@ class FacturacionController extends Controller
 
                             $withreceta = $withreceta + 1;
 
-                            //grabo el detalle de la transacción
-                            DetailTransaction::create([
-                            
-                                'transaction_id' => $transactions->id,
-                                'producto_id' => $temporary->producto_id,
-                                'impuesto_id' => $temporary->impuesto_id,
-                                'cantidad' => $temporary->cantidad,
-                                'descuento' => $temporary->descuento,
-                                'impuesto' => $temporary->impuesto,
-                                'preciounitario' => $temporary->preciounitario,
-                                'baseunitario' => $temporary->baseunitario,
-                                'costoventa' => DB::table('productos')
-                                                        ->join('recetas_has_productos', 'productos.id', '=', 'recetas_has_productos.producto_id')
-                                                        ->join('recetas', 'recetas_has_productos.receta_id', '=', 'recetas.id')
-                                                        ->where('recetas.id', $temporary->producto_id)
-                                                        ->selectRaw('SUM(recetas_has_productos.cantidad * productos.costoactual) AS coste_total')
-                                                        ->value('coste_total'),
-                                'costopromedio' => DB::table('productos')
-                                                        ->join('recetas_has_productos', 'productos.id', '=', 'recetas_has_productos.producto_id')
-                                                        ->join('recetas', 'recetas_has_productos.receta_id', '=', 'recetas.id')
-                                                        ->where('recetas.id', $temporary->producto_id)
-                                                        ->selectRaw('SUM(recetas_has_productos.cantidad * productos.costoactual) AS coste_total')
-                                                        ->value('coste_total'),
-                            
-                            ]);
-                            //fin
+                            // Costo recursivo de la receta
+                            $visitadosCosto = [];
+                            $costoRecetaDev = $this->calcularCostoReceta(
+                                $temporary->producto_id, 1.0, $visitadosCosto
+                            );
 
-                            //I get the amount current
+                            DetailTransaction::create([
+
+                                'transaction_id' => $transactions->id,
+                                'producto_id'    => $temporary->producto_id,
+                                'impuesto_id'    => $temporary->impuesto_id,
+                                'cantidad'       => $temporary->cantidad,
+                                'descuento'      => $temporary->descuento,
+                                'impuesto'       => $temporary->impuesto,
+                                'preciounitario' => $temporary->preciounitario,
+                                'baseunitario'   => $temporary->baseunitario,
+                                'costoventa'     => $costoRecetaDev,
+                                'costopromedio'  => $costoRecetaDev,
+
+                            ]);
+
                             $amountCurrent = Producto::where("id", $temporary->producto_id)->value("existenciactual");
-                            //I update the inventory
                             $producto = Producto::find($temporary->producto_id);
                             $producto->existenciactual = ($amountCurrent + $temporary->cantidad);
                             $producto->save();
 
-                            //We search the components what belong to the recipe
-                            $dataReceta = Receta::find($temporary->producto_id);
+                            // Devolver ingredientes al inventario expandiendo sub-recetas recursivamente
+                            $visitados = [];
+                            $insumos   = $this->expandirIngredientes(
+                                $temporary->producto_id,
+                                (float) $temporary->cantidad,
+                                $visitados
+                            );
 
-                            $dataReceta->productos;
-
-                            foreach($dataReceta->productos as $receta){
-
-                                //I get the amount current
-                                $amountCurrent = Producto::where("id", $receta->id)->value("existenciactual");
-                                //I update the inventory
-                                $producto = Producto::find($receta->id);
-                                $producto->existenciactual = ($amountCurrent + ($receta->pivot->cantidad * $temporary->cantidad));
-                                
-                                $producto->save();
-
+                            foreach($insumos as $insumo){
+                                $ingrediente = Producto::find($insumo['producto_id']);
+                                if($ingrediente){
+                                    $ingrediente->existenciactual = $ingrediente->existenciactual + $insumo['cantidad'];
+                                    $ingrediente->save();
+                                }
                             }
-                            //fin
-
-                            //I update current coste for finished product
-                            $producto = Producto::find($temporary->producto_id);
-                            $producto->costoactual = DB::table('productos')
-                                                            ->join('recetas_has_productos', 'productos.id', '=', 'recetas_has_productos.producto_id')
-                                                            ->join('recetas', 'recetas_has_productos.receta_id', '=', 'recetas.id')
-                                                            ->where('recetas.id', $temporary->producto_id)
-                                                            ->selectRaw('SUM(recetas_has_productos.cantidad * productos.costoactual) AS coste_total')
-                                                            ->value('coste_total');
-                            $producto->save();
 
                         }
                         //fin
@@ -1006,7 +1071,7 @@ class FacturacionController extends Controller
                             'documento_id' => $request->get('documento_id'),
                             'user_id' => Auth::id(),
                             'fecha' => $date->format("Y-m-d"),
-                            'hora' => $date->format("H-i-s"),
+                            'hora' => $date->format("H:i:s"),
                             'estado' => "N",
                             'consecutivo' => Transaccion::where("id", $request->get('transaccion_id'))->max("consecutivo"),
                             'observacion' => $request->get('observacion')               
@@ -1052,42 +1117,44 @@ class FacturacionController extends Controller
                             'documento_id' => $request->get('documento_id'),
                             'user_id' => Auth::id(),
                             'fecha' => $date->format("Y-m-d"),
-                            'hora' => $date->format("H-i-s"),
+                            'hora' => $date->format("H:i:s"),
                             'estado' => "N",
                             'consecutivo' => Transaccion::where("id", $request->get('transaccion_id'))->max("consecutivo"),
                             'observacion' => $request->get('observacion')               
                         
                         ]); 
                         
-                        //Grabo el detalle de la entrada de la materia prima por cada producto con receta
+                        // Concepto 96: solo insumos directos del nivel principal.
+                        // Sub-recetas generan sus ciclos 98→97→96 internamente.
                         foreach($temporaries as $temporary){
 
-                            //Validate if the product has recipe
                             if(DB::table('recetas_has_productos')->where('receta_id', $temporary->producto_id)->exists()){
 
-                                //We search the components what belong to the recipe
-                                $dataReceta = Receta::find($temporary->producto_id);
+                                $insumosDirectos = $this->generarTransaccionesSubRecetaDevolucion(
+                                    $temporary->producto_id,
+                                    (float) $temporary->cantidad,
+                                    $request->get('documento_id'),
+                                    Auth::id(),
+                                    $date->format("Y-m-d"),
+                                    $date->format("H:i:s"),
+                                    Transaccion::where("id", $request->get('transaccion_id'))->max("consecutivo"),
+                                    $request->get('observacion') ?? ''
+                                );
 
-                                $dataReceta->productos;
-
-                                //grabo el detalle de la transacción
-                                foreach($dataReceta->productos as $receta){
-
-                                        DetailTransaction::create([
-                                        
-                                            'transaction_id' => $transactions->id,
-                                            'producto_id' => $receta->pivot->producto_id,
-                                            'impuesto_id' => 4,
-                                            'cantidad' => $receta->pivot->cantidad * $temporary->cantidad,
-                                            'descuento' => 0,
-                                            'impuesto' => 0,
-                                            'preciounitario' => Producto::where('id', $receta->pivot->producto_id)->value('costoactual'),
-                                            'baseunitario' => Producto::where('id', $receta->pivot->producto_id)->value('costoactual'),
-                                            'costoventa' => Producto::where('id', $receta->pivot->producto_id)->value('costoactual'),
-                                            'costopromedio' => Producto::where('id', $receta->pivot->producto_id)->value('costoactual'),
-                                        
-                                        ]);
-                                        //fin
+                                foreach($insumosDirectos as $insumo){
+                                    $costoInsumo = Producto::where('id', $insumo['producto_id'])->value('costoactual');
+                                    DetailTransaction::create([
+                                        'transaction_id' => $transactions->id,
+                                        'producto_id'    => $insumo['producto_id'],
+                                        'impuesto_id'    => 4,
+                                        'cantidad'       => $insumo['cantidad'],
+                                        'descuento'      => 0,
+                                        'impuesto'       => 0,
+                                        'preciounitario' => $costoInsumo,
+                                        'baseunitario'   => $costoInsumo,
+                                        'costoventa'     => $costoInsumo,
+                                        'costopromedio'  => $costoInsumo,
+                                    ]);
                                 }
 
                             }
@@ -1108,34 +1175,37 @@ class FacturacionController extends Controller
                 break;
 
                 case 6://Devoluciones compras
-                    
+
                     //I update the inventory for each item
                     foreach($temporaries as $temporary){
 
-                        //grabo el detalle de la transacción
+                        $producto       = Producto::find($temporary->producto_id);
+                        $stockActual    = $producto->existenciactual;
+                        $costoActual    = $producto->costoactual;
+                        $valorCompra    = ($temporary->preciounitario * $temporary->cantidad) * (1 - $temporary->descuento / 100);
+                        $costoUnitario  = $valorCompra / $temporary->cantidad;
+                        $nuevoDenominador = $stockActual - $temporary->cantidad;
+                        $costoPromedio  = $nuevoDenominador > 0
+                            ? round((($stockActual * $costoActual) - $valorCompra) / $nuevoDenominador, 2)
+                            : $costoActual;
+
                         DetailTransaction::create([
-                        
+
                             'transaction_id' => $transactions->id,
-                            'producto_id' => $temporary->producto_id,
-                            'impuesto_id' => $temporary->impuesto_id,
-                            'cantidad' => $temporary->cantidad,
-                            'descuento' => $temporary->descuento,
-                            'impuesto' => $temporary->impuesto,
+                            'producto_id'    => $temporary->producto_id,
+                            'impuesto_id'    => $temporary->impuesto_id,
+                            'cantidad'       => $temporary->cantidad,
+                            'descuento'      => $temporary->descuento,
+                            'impuesto'       => $temporary->impuesto,
                             'preciounitario' => $temporary->preciounitario,
-                            'baseunitario' => $temporary->baseunitario,
-                            'costoventa' => ((($temporary->preciounitario*$temporary->cantidad)-(($temporary->preciounitario*$temporary->cantidad)*($temporary->descuento/100))) / $temporary->cantidad),
-                            'costopromedio' => ( 
-                                round(( ( (Producto::where('id', $temporary->producto_id)->value('existenciactual') * Producto::where('id', $temporary->producto_id)->value('costoactual')) + (($temporary->preciounitario*$temporary->cantidad)-(($temporary->preciounitario*$temporary->cantidad)*($temporary->descuento/100)))  ) / (Producto::where('id', $temporary->producto_id)->value('existenciactual') + $temporary->cantidad) ),2)
-                            ),                    
-                        
+                            'baseunitario'   => $temporary->baseunitario,
+                            'costoventa'     => $costoUnitario,
+                            'costopromedio'  => $costoPromedio,
+
                         ]);
 
-                        //I get the amount current
-                        $amountCurrent = Producto::where("id", $temporary->producto_id)->value("existenciactual");
-                        //I update the inventory
-                        $producto = Producto::find($temporary->producto_id);
-                        $producto->existenciactual = ($amountCurrent - $temporary->cantidad);
-                        $producto->costoactual = round(( ( (Producto::where('id', $temporary->producto_id)->value('existenciactual') * Producto::where('id', $temporary->producto_id)->value('costoactual')) + (($temporary->preciounitario*$temporary->cantidad)-(($temporary->preciounitario*$temporary->cantidad)*($temporary->descuento/100)))  ) / (Producto::where('id', $temporary->producto_id)->value('existenciactual') + $temporary->cantidad) ),2);
+                        $producto->existenciactual = $stockActual - $temporary->cantidad;
+                        $producto->costoactual     = $costoPromedio;
                         $producto->save();
 
                     }
@@ -1177,23 +1247,326 @@ class FacturacionController extends Controller
             
             $temporary->delete();
 
+            DB::commit();
+
             return response()->json([
 
-                "message" => "¡Transacción grabada con éxito!",
+                "message"        => "¡Transacción grabada con éxito!",
+                "transaction_id" => $transaccionPrincipal,
 
             ]);
-               
-        } catch (\Throwable $th) {
-            
-            return response()->json([
-                    
-                "error" =>  $th,
 
-                "message" => "¡Error en la transacción!"
-            
+        } catch (\Throwable $th) {
+
+            DB::rollBack();
+
+            \Log::error('FacturacionController@store: ' . $th->getMessage(), [
+                'file' => $th->getFile(),
+                'line' => $th->getLine(),
+            ]);
+
+            return response()->json([
+
+                "error"   => $th->getMessage(),
+                "message" => "¡Error en la transacción: " . $th->getMessage() . "!"
+
             ]);
         }
 
+    }
+
+    public function historial(){
+
+        $ventas = DB::table('transactions')
+            ->join('conceptos', 'conceptos.id', '=', 'transactions.concepto_id')
+            ->join('transacciones', 'transacciones.id', '=', 'conceptos.transaccion_id')
+            ->join('socio_negocios', 'socio_negocios.documento', '=', 'transactions.documento_id')
+            ->join('users', 'users.id', '=', 'transactions.user_id')
+            ->leftJoin('forma_pagos', 'forma_pagos.transaction_id', '=', 'transactions.id')
+            ->whereIn('conceptos.transaccion_id', [1, 2, 3, 4, 5, 6])
+            ->groupBy('transactions.id', 'transactions.fecha', 'transactions.hora',
+                      'transactions.consecutivo', 'socio_negocios.nombres',
+                      'socio_negocios.apellidos', 'users.name', 'transacciones.nombre',
+                      'conceptos.nombre')
+            ->orderBy('transactions.id', 'desc')
+            ->select(
+                'transactions.id',
+                'transactions.fecha',
+                'transactions.hora',
+                'transactions.consecutivo',
+                'transacciones.nombre AS tipo',
+                'conceptos.nombre AS concepto',
+                DB::raw("CONCAT(socio_negocios.nombres, ' ', socio_negocios.apellidos) AS cliente"),
+                'users.name AS cajero',
+                DB::raw('SUM(forma_pagos.valor) AS total')
+            )
+            ->get();
+
+        return view('facturacion.historial', compact('ventas'));
+
+    }
+
+    /**
+     * Expande recursivamente una receta hasta llegar solo a insumos (tipoproducto=1).
+     * Si un ingrediente es un servicio (tipoproducto=2) con su propia receta,
+     * se expande en sus sub-ingredientes multiplicando la cantidad.
+     * Retorna: [['producto_id' => X, 'cantidad' => Y, 'nombre' => Z], ...]
+     */
+    private function generarTransaccionesSubRecetaDevolucion(
+        int    $recetaId,
+        float  $cantidad,
+        string $docId,
+        int    $userId,
+        string $fecha,
+        string $hora,
+        int    $consecutivo,
+        string $observacion
+    ): array {
+        $ingredientes = DB::table('recetas_has_productos')
+            ->join('productos', 'productos.id', '=', 'recetas_has_productos.producto_id')
+            ->where('recetas_has_productos.receta_id', $recetaId)
+            ->select('productos.id', 'productos.nombre', 'productos.costoactual',
+                     'recetas_has_productos.cantidad')
+            ->get();
+
+        $insumosDirectos = [];
+
+        foreach ($ingredientes as $ing) {
+            $cantTotal      = $ing->cantidad * $cantidad;
+            $tieneSubReceta = DB::table('recetas_has_productos')
+                ->where('receta_id', $ing->id)->exists();
+
+            if ($tieneSubReceta) {
+                $visitadosCosto = [];
+                $costoUnit      = $this->calcularCostoReceta($ing->id, 1.0, $visitadosCosto);
+
+                // Concepto 98 — Entrada PT: Arepa "des-consumida" (regresa)
+                $tx98 = Transaction::create([
+                    'concepto_id'  => 98, 'documento_id' => $docId, 'user_id' => $userId,
+                    'fecha' => $fecha, 'hora' => $hora, 'estado' => 'N',
+                    'consecutivo'  => $consecutivo,
+                    'observacion'  => 'Dev. sub-receta Entrada PT: ' . $ing->nombre,
+                ]);
+                DetailTransaction::create([
+                    'transaction_id' => $tx98->id, 'producto_id' => $ing->id,
+                    'impuesto_id' => 4, 'cantidad' => $cantTotal,
+                    'descuento' => 0, 'impuesto' => 0,
+                    'preciounitario' => $costoUnit, 'baseunitario' => $costoUnit,
+                    'costoventa' => $costoUnit, 'costopromedio' => $costoUnit,
+                ]);
+
+                // Concepto 97 — Salida PT: Arepa "des-producida"
+                $tx97 = Transaction::create([
+                    'concepto_id'  => 97, 'documento_id' => $docId, 'user_id' => $userId,
+                    'fecha' => $fecha, 'hora' => $hora, 'estado' => 'N',
+                    'consecutivo'  => $consecutivo,
+                    'observacion'  => 'Dev. sub-receta Salida PT: ' . $ing->nombre,
+                ]);
+                DetailTransaction::create([
+                    'transaction_id' => $tx97->id, 'producto_id' => $ing->id,
+                    'impuesto_id' => 4, 'cantidad' => $cantTotal,
+                    'descuento' => 0, 'impuesto' => 0,
+                    'preciounitario' => $costoUnit, 'baseunitario' => $costoUnit,
+                    'costoventa' => $costoUnit, 'costopromedio' => $costoUnit,
+                ]);
+
+                // Concepto 96 — Entrada MP: ingredientes de la sub-receta regresan
+                $subInsumos = $this->generarTransaccionesSubRecetaDevolucion(
+                    $ing->id, $cantTotal, $docId, $userId, $fecha, $hora, $consecutivo, $observacion
+                );
+
+                if (!empty($subInsumos)) {
+                    $tx96 = Transaction::create([
+                        'concepto_id'  => 96, 'documento_id' => $docId, 'user_id' => $userId,
+                        'fecha' => $fecha, 'hora' => $hora, 'estado' => 'N',
+                        'consecutivo'  => $consecutivo,
+                        'observacion'  => 'Dev. sub-receta MP: ' . $ing->nombre,
+                    ]);
+                    foreach ($subInsumos as $si) {
+                        $costo = Producto::where('id', $si['producto_id'])->value('costoactual');
+                        DetailTransaction::create([
+                            'transaction_id' => $tx96->id, 'producto_id' => $si['producto_id'],
+                            'impuesto_id' => 4, 'cantidad' => $si['cantidad'],
+                            'descuento' => 0, 'impuesto' => 0,
+                            'preciounitario' => $costo, 'baseunitario' => $costo,
+                            'costoventa' => $costo, 'costopromedio' => $costo,
+                        ]);
+                    }
+                }
+
+            } else {
+                $insumosDirectos[] = ['producto_id' => $ing->id, 'cantidad' => $cantTotal];
+            }
+        }
+
+        return $insumosDirectos;
+    }
+
+    private function generarTransaccionesSubReceta(
+        int    $recetaId,
+        float  $cantidad,
+        string $docId,
+        int    $userId,
+        string $fecha,
+        string $hora,
+        int    $consecutivo,
+        string $observacion
+    ): array {
+        $ingredientes = DB::table('recetas_has_productos')
+            ->join('productos', 'productos.id', '=', 'recetas_has_productos.producto_id')
+            ->where('recetas_has_productos.receta_id', $recetaId)
+            ->select('productos.id', 'productos.nombre', 'productos.costoactual',
+                     'recetas_has_productos.cantidad')
+            ->get();
+
+        $insumosDirectos = [];
+
+        foreach ($ingredientes as $ing) {
+            $cantTotal      = $ing->cantidad * $cantidad;
+            $tieneSubReceta = DB::table('recetas_has_productos')
+                ->where('receta_id', $ing->id)->exists();
+
+            if ($tieneSubReceta) {
+                // Sub-receta: generar ciclo 99→98→97 recursivamente
+
+                $subInsumos = $this->generarTransaccionesSubReceta(
+                    $ing->id, $cantTotal, $docId, $userId, $fecha, $hora, $consecutivo, $observacion
+                );
+
+                // Concepto 99 — Salida MP para producir la sub-receta
+                if (!empty($subInsumos)) {
+                    $tx99 = Transaction::create([
+                        'concepto_id'  => 99, 'documento_id' => $docId, 'user_id' => $userId,
+                        'fecha'        => $fecha, 'hora' => $hora, 'estado' => 'N',
+                        'consecutivo'  => $consecutivo,
+                        'observacion'  => 'Sub-prod MP: ' . $ing->nombre,
+                    ]);
+                    foreach ($subInsumos as $si) {
+                        $costo = Producto::where('id', $si['producto_id'])->value('costoactual');
+                        DetailTransaction::create([
+                            'transaction_id' => $tx99->id, 'producto_id' => $si['producto_id'],
+                            'impuesto_id' => 4, 'cantidad' => $si['cantidad'],
+                            'descuento' => 0, 'impuesto' => 0,
+                            'preciounitario' => $costo, 'baseunitario' => $costo,
+                            'costoventa' => $costo, 'costopromedio' => $costo,
+                        ]);
+                    }
+                }
+
+                // Concepto 98 — Entrada PT: sub-receta producida
+                $visitadosCosto = [];
+                $costoUnit      = $this->calcularCostoReceta($ing->id, 1.0, $visitadosCosto);
+                $tx98 = Transaction::create([
+                    'concepto_id'  => 98, 'documento_id' => $docId, 'user_id' => $userId,
+                    'fecha'        => $fecha, 'hora' => $hora, 'estado' => 'N',
+                    'consecutivo'  => $consecutivo,
+                    'observacion'  => 'Sub-prod Entrada PT: ' . $ing->nombre,
+                ]);
+                DetailTransaction::create([
+                    'transaction_id' => $tx98->id, 'producto_id' => $ing->id,
+                    'impuesto_id' => 4, 'cantidad' => $cantTotal,
+                    'descuento' => 0, 'impuesto' => 0,
+                    'preciounitario' => $costoUnit, 'baseunitario' => $costoUnit,
+                    'costoventa' => $costoUnit, 'costopromedio' => $costoUnit,
+                ]);
+
+                // Concepto 97 — Salida PT: sub-receta consumida en la receta padre
+                $tx97 = Transaction::create([
+                    'concepto_id'  => 97, 'documento_id' => $docId, 'user_id' => $userId,
+                    'fecha'        => $fecha, 'hora' => $hora, 'estado' => 'N',
+                    'consecutivo'  => $consecutivo,
+                    'observacion'  => 'Sub-prod Salida PT: ' . $ing->nombre,
+                ]);
+                DetailTransaction::create([
+                    'transaction_id' => $tx97->id, 'producto_id' => $ing->id,
+                    'impuesto_id' => 4, 'cantidad' => $cantTotal,
+                    'descuento' => 0, 'impuesto' => 0,
+                    'preciounitario' => $costoUnit, 'baseunitario' => $costoUnit,
+                    'costoventa' => $costoUnit, 'costopromedio' => $costoUnit,
+                ]);
+
+            } else {
+                // Insumo hoja: devolver al nivel padre para que lo incluya en su concepto 99
+                $insumosDirectos[] = ['producto_id' => $ing->id, 'cantidad' => $cantTotal];
+            }
+        }
+
+        return $insumosDirectos;
+    }
+
+    private function calcularCostoReceta(int $recetaId, float $factor = 1.0, array &$visitados = []): float
+    {
+        if (in_array($recetaId, $visitados)) return 0;
+        $visitados[] = $recetaId;
+
+        $ingredientes = DB::table('recetas_has_productos')
+            ->join('productos', 'productos.id', '=', 'recetas_has_productos.producto_id')
+            ->where('recetas_has_productos.receta_id', $recetaId)
+            ->select('productos.id', 'productos.costoactual', 'recetas_has_productos.cantidad')
+            ->get();
+
+        $costo = 0;
+        foreach($ingredientes as $ing) {
+            $cantTotal      = $ing->cantidad * $factor;
+            $tieneSubReceta = DB::table('recetas_has_productos')
+                ->where('receta_id', $ing->id)->exists();
+
+            if($tieneSubReceta) {
+                // Calcular costo unitario de la sub-receta y actualizar su costoactual
+                $visitadosSub   = [];
+                $costoUnitario  = $this->calcularCostoReceta($ing->id, 1.0, $visitadosSub);
+                Producto::where('id', $ing->id)->update(['costoactual' => round($costoUnitario, 2)]);
+                $costo += $costoUnitario * $cantTotal;
+            } else {
+                $costo += $ing->costoactual * $cantTotal;
+            }
+        }
+        return $costo;
+    }
+
+    private function expandirIngredientes(int $recetaId, float $cantidadFactor, array &$visitados = []): array
+    {
+        if (in_array($recetaId, $visitados)) return []; // evitar ciclos infinitos
+        $visitados[] = $recetaId;
+
+        $ingredientes = DB::table('recetas_has_productos')
+            ->join('productos', 'productos.id', '=', 'recetas_has_productos.producto_id')
+            ->where('recetas_has_productos.receta_id', $recetaId)
+            ->select('productos.id', 'productos.nombre', 'productos.tipoproducto',
+                     'productos.existenciactual', 'recetas_has_productos.cantidad')
+            ->get();
+
+        $resultado = [];
+
+        foreach ($ingredientes as $ing) {
+            $cantTotal = $ing->cantidad * $cantidadFactor;
+
+            // Es sub-receta si tiene sus propios ingredientes en recetas_has_productos
+            $esSubReceta = DB::table('recetas_has_productos')
+                ->where('receta_id', $ing->id)
+                ->exists();
+
+            if ($esSubReceta) {
+                // Expandir sub-receta recursivamente
+                $sub = $this->expandirIngredientes($ing->id, $cantTotal, $visitados);
+                $resultado = array_merge($resultado, $sub);
+            } else {
+                // Insumo hoja — agregar o acumular
+                $key = $ing->id;
+                if (isset($resultado[$key])) {
+                    $resultado[$key]['cantidad'] += $cantTotal;
+                } else {
+                    $resultado[$key] = [
+                        'producto_id'      => $ing->id,
+                        'nombre'           => $ing->nombre,
+                        'cantidad'         => $cantTotal,
+                        'existenciactual'  => $ing->existenciactual,
+                    ];
+                }
+            }
+        }
+
+        return $resultado;
     }
 
     public function mesas(){

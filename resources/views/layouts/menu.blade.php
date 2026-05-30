@@ -5,9 +5,14 @@
 </li>
 
 @can('ver-facturacion')
-<li class="side-menus {{ Request::is('*') ? 'active' : '' }}">
+<li class="side-menus {{ Request::is('facturacion') ? 'active' : '' }}">
     <a class="nav-link" href="{{ route('facturacion.index') }}">
         <i class="fa-solid fa-users"></i><span>Facturación</span>
+    </a>
+</li>
+<li class="side-menus {{ Request::is('facturacion/historial') ? 'active' : '' }}">
+    <a class="nav-link" href="{{ route('facturacion.historial') }}">
+        <i class="fas fa-history"></i><span>Historial transacciones</span>
     </a>
 </li>
 @endcan
@@ -147,6 +152,12 @@
     </a>
 </li>
 @endcan
+
+<li class="side-menus {{ Request::is('cierres*') ? 'active' : '' }}">
+    <a class="nav-link" href="{{ route('cierres.index') }}">
+        <i class="fas fa-calendar-check"></i><span>Cierre de mes</span>
+    </a>
+</li>
 
 @can('ver-informe')
 <li class="side-menus {{ Request::is('*') ? 'active' : '' }}">

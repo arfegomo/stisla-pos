@@ -518,9 +518,10 @@
                         success:function(data){
 
                             if(data.transaccion == ""){
-                                
+
                                 alertify.set('notifier','position', 'bottom-right');
-                                alertify.error(`${data.message}`);                            
+                                alertify.error(`${data.message}`);
+                                return;
 
                             }else{
                                 
@@ -782,7 +783,11 @@
 
     //Pagar y grabar factura
     $("#pagar").click(function(){
-        
+
+        var $btn = $(this);
+        if($btn.prop('disabled')) return;
+        $btn.prop('disabled', true).text('Procesando...');
+
         var concepto = $("#concepto").val();
         var documento = $("#documentoID").val();
         var consecutivo = $("#consecutivo").val();
@@ -824,39 +829,47 @@
                     headers: {'X-CSRF-TOKEN': $('meta[name="csrf-token"]').attr('content')},
                     
                     success:function(data){
-                        
-                        //console.log(data.existe);
 
-                        $('#exampleModal').modal('hide'); //cerramos el modal
+                        if(data.error){
+                            $btn.prop('disabled', false).text('Pagar');
+                            alertify.set('notifier','position', 'top-center');
+                            alertify.error(data.message);
+                            return;
+                        }
 
-                        alertify.set('notifier','position', 'top-center');
-                        alertify.success(`${data.message}`);
-                        	
-                        $("#transaccion")[0].reset();
+                        $('#exampleModal').modal('hide');
 
-                        $("#pago")[0].reset();
+                        var transactionId = data.transaction_id;
 
-                        $("#tbodyProducto").html("");
+                        Swal.fire({
+                            title: '¡Venta registrada!',
+                            text: '¿Desea imprimir el ticket?',
+                            icon: 'success',
+                            showCancelButton: true,
+                            confirmButtonColor: '#3085d6',
+                            cancelButtonColor: '#aaa',
+                            confirmButtonText: 'Sí, imprimir',
+                            cancelButtonText: 'No, continuar'
+                        }).then(function(result) {
 
-                        $('#resumenTotal').val("");
-                        $('#resumenDescuento').val("");
-                        $('#resumenImpuesto').val("");
-                        $('#resumenSubtotal').val("");
+                            if(result.isConfirmed && transactionId){
+                                $.ajax({
+                                    url: '/ticket/imprimir/' + transactionId,
+                                    type: 'POST',
+                                    headers: {'X-CSRF-TOKEN': $('meta[name="csrf-token"]').attr('content')},
+                                    success: function(res){
+                                        if(res.error){
+                                            Swal.fire('Error', res.message, 'error');
+                                        }
+                                    },
+                                    error: function(xhr){
+                                        Swal.fire('Error de impresión', xhr.responseJSON ? xhr.responseJSON.message : 'No se pudo conectar con la impresora.', 'error');
+                                    }
+                                });
+                            }
 
-                        $('#socio').attr("readonly", false);
-                        $('#socio').focus();
-
-                        url = "{{ route('facturacion.index') }}";
-                        
-                        $(location).attr('href',url);
-
-                        /*transaccion = 1;
-
-                        $("#socio").val("Cuantías Menores");
-
-                        $("#documentoID").val(222222222);
-
-                        $("#producto").focus();*/
+                            $(location).attr('href', "{{ route('facturacion.index') }}");
+                        });
 
                     }
 

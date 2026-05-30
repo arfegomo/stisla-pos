@@ -68,80 +68,16 @@
 
                         @endif
 
-                        <div class="row">
+                        {{-- Indicador de conexión en tiempo real --}}
+                        <div class="d-flex align-items-center mb-3 mt-2">
+                            <span id="sse-indicator" class="badge badge-secondary mr-3 p-2">
+                                <i class="fas fa-circle"></i> Conectando...
+                            </span>
+                            <small class="text-muted">&nbsp; Actualización en tiempo real</small>
+                        </div>
 
-                            @foreach($mesas as $mesa)
-
-                                @if($mesa->id != 1000)
-
-                                @php 
-                                    $value = \Illuminate\Support\Facades\DB::table('temporaries')->where('mesa_id', $mesa->id)->exists()
-                                @endphp
-
-                                    @if($value == 1)
-                                    @php
-                                        $total = \Illuminate\Support\Facades\DB::table('temporaries')->where('mesa_id', $mesa->id)->selectRaw('SUM(preciounitario * cantidad) as total')->first();
-                                    @endphp
-
-                                    <div class="col-lg-2" style="padding-top: 20px">
-
-                                        <form method="POST" action="{{ route('facturacion.close') }}">
-
-                                            @csrf
-            
-                                            <input type="hidden" name="mesa" value="{{ $mesa->id }}"/>
-
-                                                @php 
-                                                    $consecutivo = \Illuminate\Support\Facades\DB::table('temporaries')->where('mesa_id', $mesa->id)->value('consecutivo_id')
-                                                @endphp 
-
-                                                <div class="col-lg-12 draggable ui-widget-content">
-
-                                                    <div class="draggable ui-widget-content cursor-wait" id="{{ $mesa->id }}">
-                                                        <div><i class="fa-solid fa-2x fa-sack-dollar"></i><strong><span style="padding-left: 5px; text-transform: uppercase; font-size: 22px">${{ number_format($total->total,0,',') }}</span></strong></div>
-                                                        <div>Cliente: <span style="text-transform: uppercase"><strong>{{ $mesa->responsable }}</span></strong></div>
-
-                                                        <div class="col-lg-2">
-                                                    
-                                                            <button type="submit" class="btn btn-danger btn-lg active btn-block" role="button" aria-pressed="true"><b>Mesa: {{ $mesa->id }} </b><br><img alt="image" src="{{ asset('img/mesa.png') }}"></button><hr>
-
-                                                        </div>
-
-                                                    </div>
-
-                                                </div>
-
-                                                <input type="hidden" name="consecutivo" value="{{ $consecutivo }}"/>
-
-                                        </form>
-
-                                    </div>
-
-                                    @else
-
-                                    <div class="col-lg-2" style="padding-top: 20px">
-
-                                        <div class="droppable ui-widget-content" id="{{ $mesa->id }}">
-                                            <div><i class="fa-regular fa-2x fa-folder-open"></i></div>
-                                            <div>Libre</div>
-
-                                            <div class="col-lg-12">
-
-                                                <button type="button" data-id="{{ $mesa->id }}" id="openModal" class="btn btn-linght btn-lg active btn-block" role="button" aria-pressed="true"><b>Mesa: {{ $mesa->id }} </b><br><img alt="image" src="{{ asset('img/mesa.png') }}"></button>
-
-                                            </div>
-
-                                        </div>
-
-
-                                    </div>
-
-                                    @endif
-
-                                @endif
-
-                            @endforeach                            
-
+                        <div class="row" id="mesas-container">
+                            @include('mesas.partial')
                         </div>
                             </div>
                         </div>
@@ -205,7 +141,7 @@
     @endsection
 
     @section('js')
-        
+
         <script src="https://cdn.datatables.net/1.13.2/js/jquery.dataTables.min.js"></script>
         <script src="https://cdn.datatables.net/1.13.2/js/dataTables.bootstrap5.min.js"></script>
         <script src="https://cdn.datatables.net/1.13.4/js/dataTables.bootstrap5.min.js"></script>
@@ -302,8 +238,57 @@
 
         })
 
-        </script>   
-    
+        </script>
+
+        {{-- SSE: actualización en tiempo real del estado de las mesas --}}
+        <script>
+            var sseSource = null;
+
+            function iniciarSSE() {
+                if(sseSource) sseSource.close();
+
+                sseSource = new EventSource('{{ route("mesas.stream") }}');
+
+                sseSource.onopen = function() {
+                    $('#sse-indicator')
+                        .removeClass('badge-secondary badge-danger')
+                        .addClass('badge-success')
+                        .html('<i class="fas fa-circle"></i> En tiempo real');
+                };
+
+                sseSource.onmessage = function(e) {
+                    // Actualizar el contenedor de mesas con el HTML fresco del servidor
+                    $.ajax({
+                        url: '{{ route("mesas.partial") }}',
+                        type: 'GET',
+                        success: function(html) {
+                            $('#mesas-container').html(html);
+                        }
+                    });
+                };
+
+                sseSource.onerror = function() {
+                    $('#sse-indicator')
+                        .removeClass('badge-secondary badge-success')
+                        .addClass('badge-danger')
+                        .html('<i class="fas fa-circle"></i> Reconectando...');
+
+                    // El navegador reconecta automáticamente, pero forzamos después de 5s
+                    setTimeout(function() {
+                        iniciarSSE();
+                    }, 5000);
+                };
+            }
+
+            $(document).ready(function() {
+                iniciarSSE();
+            });
+
+            // Cerrar la conexión SSE al salir de la página
+            window.addEventListener('beforeunload', function() {
+                if(sseSource) sseSource.close();
+            });
+        </script>
 
     @endsection
 

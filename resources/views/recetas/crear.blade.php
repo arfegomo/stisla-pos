@@ -90,30 +90,22 @@
             },
         
             success: function( data ) {
-                
-                //console.log(data)
-                
-                response($.map(data, function(item) {
-        
-                                    return {
-                    
-                                        label: item.nombre,
-                                        value: item.id,   
-                                        
-                                    };
 
-                                }
-                ));
+                response($.map(data, function(item) {
+                    return {
+                        label: '[' + item.etiqueta + '] ' + item.nombre,
+                        value: item.id,
+                        etiqueta: item.etiqueta
+                    };
+                }));
                 
             }
             });
         },
         
         select: function (event, ui) {
-        
             $('#producto').val(ui.item.label);
             $('#producto_id').val(ui.item.value);
-            //console.log(ui.item); 
             return false;
         }
 

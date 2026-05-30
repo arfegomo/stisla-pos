@@ -31,6 +31,8 @@ Route::group(['middleware' => ['auth']], function(){
 	Route::resource('facturacion', FacturacionController::class)->only('index','store');
 	Route::resource('recetas', RecetaController::class);
 	Route::resource('inventarios', InventarioController::class);
+	Route::get('mesas/stream', 'MesaController@stream')->name('mesas.stream');
+	Route::get('mesas/partial', 'MesaController@partial')->name('mesas.partial');
 	Route::resource('mesas', MesaController::class);
 
 	Route::delete('facturacion/{id}/{consecutivo}', 'FacturacionController@destroy')->name('facturacion.destroy');
@@ -54,10 +56,16 @@ Route::group(['middleware' => ['auth']], function(){
 	Route::get('inventario/all-kardex', 'InventarioController@updateInventario')->name('inventario.all-kardex');
 
 	Route::get('facturacion/mesas','FacturacionController@mesas')->name('facturacion.mesas');
+	Route::get('facturacion/historial','FacturacionController@historial')->name('facturacion.historial');
 	Route::post('facturacion-mesas','FacturacionController@indexMesas')->name('facturacion.index-mesas');
 
 	Route::get('informe/load', 'InformeController@load')->name('informe.load');
 	Route::post('informe/fiscal', 'InformeController@fiscal')->name('informe.fiscal');
+
+	Route::resource('cierres', CierreController::class)->only('index', 'store');
+	Route::post('ticket/imprimir/{transaction}', 'TicketController@imprimir')->name('ticket.imprimir');
+	Route::get('ticket/previsualizar/{transaction}', 'TicketController@previsualizar')->name('ticket.previsualizar');
+	Route::get('ticket/test-escpos/{transaction}', 'TicketController@testEscPos')->name('ticket.test');
 
 	Route::put('faturacion', 'MesaController@updateMesa')->name('mesa.update-mesa');
 	Route::put('facturacion', 'MesaController@trasladarMesa')->name('mesa.trasladar-mesa');

@@ -172,7 +172,7 @@
                             <label for="tipoproducto" class="col-md-4 col-form-label text-md-right">{{ __('Tipo de producto') }}</label>
 
                             <div class="col-md-6">
-                                {!! Form::select('tipoproducto',["1" => "Inventario", "2" => "Servicios"], null, array(
+                                {!! Form::select('tipoproducto',["0" => "-- Elija tipo de producto --", "1" => "Inventario", "2" => "Servicios"], $producto->tipoproducto, array(
                                     'class'=>'form-control',
                                 )) !!}
 

@@ -313,8 +313,10 @@
                                     
                                 </div>
 
+                                <div id="errorPago" class="alert alert-danger mx-3" style="display:none"></div>
+
                                 <div class="modal-footer" id="pague" style="display: none">
-                                
+
                                     <button type="button" class="btn btn-dark" data-bs-dismiss="modal">Cancelar</button>
                                     <button type="button" id="pagar" class="btn btn-primary">Pagar</button>
 
@@ -799,7 +801,11 @@ $(document).ready(function() {
 
     //Pagar y grabar factura
     $("#pagar").click(function(){
-        
+
+        var $btn = $(this);
+        if($btn.prop('disabled')) return;
+        $btn.prop('disabled', true).text('Procesando...');
+
         var concepto = $("#concepto").val();
         var documento = $("#documentoID").val();
         var consecutivo = $("#consecutivo").val();
@@ -807,7 +813,7 @@ $(document).ready(function() {
         var total = $("#total").val();
         var transaccion_id = $("#transaccion_id").val();
         var mesa = {{ $mesa }};
-        
+
         //capturo los id y valores de las multiples formas de pago
         const valoresCheck = [];
 
@@ -815,8 +821,6 @@ $(document).ready(function() {
             valoresCheck.push({"id":Number(this.value), "valor":Number($("#valor"+this.value).val())});
         });
 
-        //console.log(valoresCheck);
- 
         //Grabar tabla transactions (encabezado de la factura)
         srcRoute = "{{ route('facturacion.store') }}"
 
@@ -838,23 +842,60 @@ $(document).ready(function() {
                     },
 
                     headers: {'X-CSRF-TOKEN': $('meta[name="csrf-token"]').attr('content')},
-                    
+
                     success:function(data){
-                        
-                        //console.log(data)
-                        $('#exampleModal').modal('hide'); //cerramos el modal
 
+                        if(data.error){
+                            $btn.prop('disabled', false).text('Pagar');
+                            $('#errorPago').text(data.message).show();
+                            console.error('Error transacción:', data.error);
+                            return;
+                        }
+
+                        $('#errorPago').hide();
+                        $('#exampleModal').modal('hide');
+
+                        var transactionId = data.transaction_id;
+
+                        Swal.fire({
+                            title: '¡Venta registrada!',
+                            text: '¿Desea imprimir el ticket?',
+                            icon: 'success',
+                            showCancelButton: true,
+                            confirmButtonColor: '#3085d6',
+                            cancelButtonColor: '#aaa',
+                            confirmButtonText: 'Sí, imprimir',
+                            cancelButtonText: 'No, continuar'
+                        }).then(function(result) {
+
+                            if(result.isConfirmed && transactionId){
+                                $.ajax({
+                                    url: '/ticket/imprimir/' + transactionId,
+                                    type: 'POST',
+                                    headers: {'X-CSRF-TOKEN': $('meta[name="csrf-token"]').attr('content')},
+                                    success: function(res){
+                                        if(res.error){
+                                            Swal.fire('Error', res.message, 'error');
+                                        }
+                                    },
+                                    error: function(xhr){
+                                        Swal.fire('Error de impresión', xhr.responseJSON ? xhr.responseJSON.message : 'No se pudo conectar con la impresora.', 'error');
+                                    }
+                                });
+                            }
+
+                            $(location).attr('href', "{{ route('facturacion.index') }}");
+                        });
+
+                    },
+
+                    error: function(){
+                        $btn.prop('disabled', false).text('Pagar');
                         alertify.set('notifier','position', 'top-center');
-                        alertify.success(`${data.message}`);                        
-
-                        url = "{{ route('facturacion.index') }}";
-                        
-                        $(location).attr('href',url);
-
+                        alertify.error('Error al procesar la transacción. Intente de nuevo.');
                     }
 
-        })
-
+        });
 
     });
 //Fin Load
@@ -870,6 +911,7 @@ $(document).on('click','#openModal',function(e){
     
     $("#ocultar1").css("display","none");
 
+    $('#errorPago').hide();
     $('#exampleModal').modal('show'); //abrir
 })    
 //Fin llamado modal
